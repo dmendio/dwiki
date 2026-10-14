@@ -1,6 +1,6 @@
 ![dwiki logo](./img/logo.png)
 
-A light, file-agnostic wiki plugin for Neovim. No dedicated wiki directory or imposed structure.
+A minimal, filetype-agnostic wiki plugin for Neovim. No dedicated wiki directory or imposed structure.
 
 Inspired by [wiki.vim](https://github.com/lervag/wiki.vim)!
 
