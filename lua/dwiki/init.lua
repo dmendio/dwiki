@@ -20,8 +20,17 @@ local defaults = {
     -- Filetype -> lines, multiline string, or function(ctx)
     templates = {},
 
-    -- key for link creation / following. False disables
+    -- Key for link creation / following. False disables
     link_key = '<CR>',
+
+    -- Keys for renaming and deleting
+    rename_key = '<leader>wr',
+    delete_key = '<leader>wd',
+
+    -- Link update behavior
+    link_updates = {
+        on_rename = true
+    },
 
     -- true: :wq saves and quits every unsaved file in the history stack
     wqall = false
@@ -43,6 +52,285 @@ local function enabled(buf)
         if ft == filetype(value) then return true end
     end
     return false
+end
+
+local uv = vim.uv or vim.loop
+local wiki_root
+
+local function absolute(path)
+    return vim.fn.simplify(vim.fn.fnamemodify(path, ':p'))
+end
+
+local function remember_root(buf)
+    if wiki_root or vim.bo[buf].buftype ~= '' then return end
+    local path = api.nvim_buf_get_name(buf)
+    local stat = path ~= '' and uv.fs_stat(path) or nil
+    if path ~= '' and (not stat or stat.type == 'file') then
+        wiki_root = vim.fn.fnamemodify(absolute(path), ':h')
+    end
+end
+
+local function problem(message)
+    vim.notify('dwiki: ' .. tostring(message), vim.log.levels.ERROR)
+end
+
+local function rewrite_links(text, source, old, new)
+    local count = 0
+    local function target(raw, style)
+        local leading, value, trailing = raw:match('^(%s*)(.-)(%s*)$')
+        local wrapped = style == 'markdown' and value:match('^<.*>$')
+        if wrapped then value = value:sub(2, -2) end
+        local path, fragment = value:match('^([^#]*)(#.*)$')
+        path, fragment = path or value, fragment or ''
+        if style == 'markdown' then
+            path = path:gsub('%%(%x%x)', function(hex) return string.char(tonumber(hex, 16)) end)
+        end
+        if path == '' or path:match('^[%a][%w+.-]*:') then return raw end
+        local implicit = style == 'wiki' and not vim.fn.fnamemodify(path, ':t'):match('%.[^%.]+$')
+        local resolved = path
+        if implicit then resolved = resolved .. '.md' end
+        if resolved:sub(1, 2) == '~/' then
+            resolved = vim.fn.expand('~') .. resolved:sub(2)
+        elseif resolved:sub(1, 1) ~= '/' then
+            resolved = vim.fn.fnamemodify(source, ':h') .. '/' .. resolved
+        end
+        if absolute(resolved) ~= old then return raw end
+        local name = vim.fn.fnamemodify(new, ':t')
+        if implicit and name:sub(-3) == '.md' then name = name:sub(1, -4) end
+        path = (path:match('^(.*[/])') or '') .. name
+        if style == 'markdown' then
+            path = path:gsub('[%%%(%)%[%]%s#?<>]', function(char)
+                return string.format('%%%02X', char:byte())
+            end)
+        end
+        value = path .. fragment
+        if wrapped then value = '<' .. value .. '>' end
+        count = count + 1
+        return leading .. value .. trailing
+    end
+    local out, offset = {}, 1
+    while offset <= #text do
+        local wf, wl, contents = text:find('%[%[([^%[%]\n]-)%]%]', offset)
+        local mf, ml, label, destination = text:find('(%b[])(%b())', offset)
+        if wf and (not mf or wf <= mf) then
+            out[#out + 1] = text:sub(offset, wf - 1)
+            local path, alias = contents:match('^([^|]*)|(.*)$')
+            out[#out + 1] = '[[' .. target(path or contents, 'wiki') .. (alias and '|' .. alias or '') .. ']]'
+            offset = wl + 1
+        elseif mf then
+            out[#out + 1] = text:sub(offset, mf - 1)
+            out[#out + 1] = label .. '(' .. target(destination:sub(2, -2), 'markdown') .. ')'
+            offset = ml + 1
+        else
+            out[#out + 1] = text:sub(offset)
+            break
+        end
+    end
+    return table.concat(out), count
+end
+
+local function read_bytes(path)
+    local file, err = io.open(path, 'rb')
+    if not file then error(err) end
+    local bytes = file:read('*a')
+    file:close()
+    return bytes
+end
+
+local function write_bytes(path, bytes)
+    local file, err = io.open(path, 'wb')
+    if not file then error(err) end
+    local ok, why = file:write(bytes)
+    local closed, close_err = file:close()
+    if not ok or not closed then error(why or close_err) end
+end
+
+local function rename_page(buf, old, new)
+    if not api.nvim_buf_is_valid(buf) or api.nvim_buf_get_name(buf) ~= old then
+        error('page changed while the rename prompt was open')
+    end
+    if uv.fs_lstat(new) or vim.fn.bufnr(new) ~= -1 then error('destination already exists') end
+    local stat = uv.fs_lstat(old)
+    if not stat or stat.type ~= 'file' then error('save the page to a regular file before renaming') end
+
+    local disk, buffers, total = {}, {}, 0
+    if config.link_updates.on_rename ~= false then
+        local loaded = {}
+        for _, b in ipairs(api.nvim_list_bufs()) do
+            if api.nvim_buf_is_loaded(b) and vim.bo[b].buftype == '' then
+                loaded[absolute(api.nvim_buf_get_name(b))] = b
+            end
+        end
+        local function inside(path)
+            return path:sub(1, #wiki_root + (wiki_root == '/' and 0 or 1)) ==
+                wiki_root .. (wiki_root == '/' and '' or '/')
+        end
+        local function visit(path)
+            local bytes = read_bytes(path)
+            if bytes:find('\0', 1, true) then return end
+            local changed, n = rewrite_links(bytes, path, old, new)
+            if n > 0 then disk[#disk + 1] = { path = path, before = bytes, after = changed } end
+            if not loaded[path] then total = total + n end
+        end
+        local function crawl(dir)
+            local scan, err = uv.fs_scandir(dir)
+            if not scan then error(err) end
+            while true do
+                local name, kind = uv.fs_scandir_next(scan)
+                if not name then break end
+                local path = dir .. (dir == '/' and '' or '/') .. name
+                if kind == 'directory' then crawl(path)
+                elseif kind == 'file' then visit(path) end
+            end
+        end
+        crawl(wiki_root)
+        for path, b in pairs(loaded) do
+            local st = uv.fs_lstat(path)
+            if inside(path) and (not st or st.type == 'file') then
+                local lines = api.nvim_buf_get_lines(b, 0, -1, false)
+                local changed, n = rewrite_links(table.concat(lines, '\n'), path, old, new)
+                total = total + n
+                if n > 0 then
+                    if not vim.bo[b].modifiable then error('buffer is not modifiable: ' .. path) end
+                    buffers[#buffers + 1] = {
+                        buf = b,
+                        before = lines,
+                        after = vim.split(changed, '\n', { plain = true }),
+                        modified = vim.bo[b].modified,
+                    }
+                end
+            end
+        end
+    end
+
+    local renamed, err = uv.fs_rename(old, new)
+    if not renamed then error(err) end
+    local written, edited = {}, {}
+    local ok, failure = pcall(function()
+        api.nvim_buf_set_name(buf, new)
+        for _, entry in ipairs(disk) do
+            entry.actual = entry.path == old and new or entry.path
+            written[#written + 1] = entry
+            write_bytes(entry.actual, entry.after)
+        end
+        for _, entry in ipairs(buffers) do
+            edited[#edited + 1] = entry
+            api.nvim_buf_set_lines(entry.buf, 0, -1, false, entry.after)
+            vim.bo[entry.buf].modified = entry.modified
+        end
+    end)
+    if not ok then
+        local errors = {}
+        local function rollback(fn)
+            local success, why = pcall(fn)
+            if not success then errors[#errors + 1] = tostring(why) end
+        end
+        for _, entry in ipairs(written) do
+            rollback(function() write_bytes(entry.actual, entry.before) end)
+        end
+        for _, entry in ipairs(edited) do
+            rollback(function()
+                api.nvim_buf_set_lines(entry.buf, 0, -1, false, entry.before)
+                vim.bo[entry.buf].modified = entry.modified
+            end)
+        end
+        rollback(function() assert(uv.fs_rename(new, old)) end)
+        rollback(function() api.nvim_buf_set_name(buf, old) end)
+        error(tostring(failure) .. (#errors > 0 and
+            '\nRollback errors: ' .. table.concat(errors, '; ') or ' (rolled back)'))
+    end
+    for _, stack in pairs(history) do
+        for _, origin in ipairs(stack) do
+            if origin.path == old then origin.path = new end
+        end
+    end
+    if config.update_links_on_rename ~= false then
+        vim.notify(('Updated %d links in folder %s'):format(total, wiki_root))
+    else
+        vim.notify(('Renamed page to %s'):format(new))
+    end
+end
+
+function dwiki.rename()
+    local buf = api.nvim_get_current_buf()
+    if not enabled(buf) then return end
+    remember_root(buf)
+    local old = api.nvim_buf_get_name(buf)
+    if old == '' or vim.bo[buf].buftype ~= '' then return problem('page has no filename') end
+
+    local stem = vim.fn.fnamemodify(old, ':t:r')
+    vim.ui.input({ prompt = 'New page name: ', default = stem }, function(name)
+        if name == nil then return end
+        name = vim.trim(name)
+        if name == '' or name == stem then return end
+        if name == '.' or name == '..' or name:find('[/\\%[%]|#?<>:"%c]') then
+            return problem('enter a filename, not a path; unsupported filename characters')
+        end
+        if config.lowercase then name = name:lower() end
+        if config.whitespace ~= false then
+            name = name:gsub('%s+', function() return config.whitespace end)
+        end
+        if not name:match('%.[^%.]+$') then
+            local ext = vim.fn.fnamemodify(old, ':e')
+            if ext ~= '' then name = name .. '.' .. ext end
+        end
+        local new = vim.fn.fnamemodify(old, ':h') .. '/' .. name
+        if new == old then return end
+        local ok, err = pcall(rename_page, buf, old, new)
+        if not ok then problem(err) end
+    end)
+end
+
+function dwiki.delete()
+    local buf, win = api.nvim_get_current_buf(), api.nvim_get_current_win()
+    if not enabled(buf) then return end
+    local path = api.nvim_buf_get_name(buf)
+    if path == '' or vim.bo[buf].buftype ~= '' then return problem('page has no filename') end
+    local tick = api.nvim_buf_get_changedtick(buf)
+    local prompt = 'Delete ' .. path .. '?' .. (vim.bo[buf].modified and ' Unsaved changes will be discarded.' or '')
+    vim.ui.input({ prompt = prompt .. ' (y/N): ' }, function(answer)
+        if not answer then return end
+        answer = vim.trim(answer):lower()
+        if answer ~= 'y' and answer ~= 'yes' then return end
+        if not api.nvim_buf_is_valid(buf) or api.nvim_buf_get_name(buf) ~= path or
+            api.nvim_buf_get_changedtick(buf) ~= tick then return problem('page changed; please retry deletion') end
+        if api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == buf then
+            local navigated, why = pcall(api.nvim_win_call, win, function()
+                local stack = history[win] or {}
+                while #stack > 0 do
+                    local origin = stack[#stack]
+                    local loaded = api.nvim_buf_is_valid(origin.buf) and api.nvim_buf_is_loaded(origin.buf)
+                    if origin.buf == buf or origin.path == path or
+                        (not loaded and (origin.path == '' or not uv.fs_stat(origin.path))) then
+                        table.remove(stack)
+                    else
+                        dwiki.back()
+                        break
+                    end
+                end
+                if api.nvim_get_current_buf() == buf then
+                    local blank = api.nvim_create_buf(true, false)
+                    vim.cmd('hide buffer ' .. blank)
+                end
+            end)
+            if not navigated then return problem(why) end
+        end
+        local ok, err = uv.fs_unlink(path)
+        if not ok then
+            if api.nvim_win_is_valid(win) then
+                pcall(api.nvim_win_call, win, function() vim.cmd('hide buffer ' .. buf) end)
+            end
+            return problem(err)
+        end
+        for _, stack in pairs(history) do
+            for i = #stack, 1, -1 do
+                if stack[i].buf == buf or stack[i].path == path then table.remove(stack, i) end
+            end
+        end
+        local removed, why = pcall(api.nvim_buf_delete, buf, { force = true })
+        if not removed then return problem('file deleted, but buffer could not be closed: ' .. tostring(why)) end
+        vim.notify('dwiki: Deleted ' .. path)
+    end)
 end
 
 local function navigate(command)
@@ -290,6 +578,8 @@ local function attach(buf)
         table.insert(attached[buf], { mode = mode, key = key, desc = desc })
     end
     map('n', '<BS>', dwiki.back, 'dwiki: Previous linked file')
+    if config.rename_key then map('n', config.rename_key, dwiki.rename, 'dwiki: Rename page') end
+    if config.delete_key then map('n', config.delete_key, dwiki.delete, 'dwiki: Delete page') end
     if config.link_key == false then return end
     map('n', config.link_key, dwiki.follow, 'dwiki: Follow link or create word link')
     map('x', config.link_key, '<Esc><Cmd>lua require("dwiki").create()<CR>', 'dwiki: Create link')
@@ -325,6 +615,18 @@ function dwiki.setup(opts)
         api.nvim_replace_termcodes('<BS>', true, false, true),
         'dwiki: link_key cannot use Backspace (reserved for back navigation)')
     end
+    local keys = { [api.nvim_replace_termcodes('<BS>', true, false, true)] = true }
+    for _, option in ipairs({ 'link_key', 'rename_key', 'delete_key' }) do
+        local key = next_config[option]
+        assert(key == false or (type(key) == 'string' and key ~= ''),
+            'dwiki: ' .. option .. ' must be a nonempty string or false')
+        if key then
+            local expanded = key:gsub('<[Ll][Ee][Aa][Dd][Ee][Rr]>', function() return vim.g.mapleader or '\\' end)
+            expanded = api.nvim_replace_termcodes(expanded, true, false, true)
+            assert(not keys[expanded], 'dwiki: page/link keys must be distinct and cannot use Backspace')
+            keys[expanded] = true
+        end
+    end
     for _, ft in ipairs(next_config.filetypes) do
         assert(type(ft) == 'string', 'dwiki: filetypes must contain strings')
     end
@@ -339,6 +641,15 @@ function dwiki.setup(opts)
     config = next_config
 
     local group = api.nvim_create_augroup('Dwiki', { clear = true })
+    api.nvim_create_user_command('DwikiRename', dwiki.rename, { desc = 'Rename wiki page and update links' })
+    api.nvim_create_user_command('DwikiDelete', dwiki.delete, { desc = 'Delete wiki page' })
+    api.nvim_create_autocmd({ 'BufReadPost', 'BufNewFile', 'BufEnter' }, {
+        group = group, callback = function(ev) remember_root(ev.buf) end,
+    })
+    -- Buffer IDs preserve creation order when setup is lazy-loaded.
+    local initial_buffers = api.nvim_list_bufs()
+    table.sort(initial_buffers)
+    for _, buf in ipairs(initial_buffers) do remember_root(buf) end
 
     if config.wqall then
         api.nvim_create_user_command('DwikiWq', function(opts)
